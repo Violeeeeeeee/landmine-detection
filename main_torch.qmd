@@ -1,0 +1,283 @@
+---
+jupyter: convkan
+title: Variables
+---
+
+
+
+This notebook demonstrates the procedure presented in
+
+```{python}
+import os
+import numpy as np
+from sklearn.utils import shuffle
+from sklearn.model_selection import train_test_split
+from tqdm import tqdm
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import TensorDataset, DataLoader
+
+import PreProcessing
+import net_torch as net # Make sure this points to your new PyTorch net.py
+from python_patch_extractor import PatchExtractor
+
+# Set PyTorch device (GPU if available)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
+```
+
+```{python}
+in_path = 'giuriati_2/20170621_deg0_HHVV.npy'
+out_path = 'cnn_article'
+architecture = 'Auto3D2'
+ny = 3 # number of adjacent B-scans to be considered / Channels
+data_augmentation = True
+preprocessing = 'normalize'
+patch_size = 64
+patch_stride = 4
+n_bsc = 5 # number of B_scans for training
+
+def parse_pp(string):
+    return getattr(PreProcessing, string)
+
+def parse_net(string):
+    # Modified to accommodate PyTorch class initialization
+    if string == 'Auto3D2':
+        return net.Autoencoder2 # Assuming you named the class Autoencoder2 in net.py
+    # Add other mappings if needed
+
+if not os.path.exists(out_path):
+    os.makedirs(out_path)
+
+field, campaign = in_path.split('/')
+campaign, extension = campaign.split('.')
+```
+
+# Load Datasets & Block Extraction
+
+(This section remains mostly identical because it relies on standard NumPy and your custom extractors, but we add a crucial .transpose() step at the very end to prepare for PyTorch).
+
+```{python}
+
+dataset = np.load('./datasets/'+str(in_path), allow_pickle=True).item()
+train_bsc_idx = np.where(np.asarray(dataset['ground_truth']) == 0)[0][:n_bsc]
+trainset = dataset['data'][train_bsc_idx]
+trainset = np.moveaxis(trainset, np.argmin(trainset.shape), -1)
+del dataset
+
+if patch_size is not None:
+    patch_size_tuple = (patch_size, patch_size)
+else:
+    patch_size_tuple = trainset.shape[1:]
+
+patch_size_tuple = patch_size_tuple + (ny,)
+patch_stride_tuple = (patch_stride, patch_stride, 1)
+
+pe = PatchExtractor(patch_size_tuple, stride=patch_stride_tuple)
+
+train_patches = pe.extract(trainset)
+train_patches = train_patches.reshape((-1,) + patch_size_tuple)
+
+# preprocessing each patch
+train_patches, min_tr, max_tr = PreProcessing.apply_transform(
+    train_patches, transform=parse_pp(preprocessing)
+)
+
+if data_augmentation:
+    train_patches = np.concatenate([train_patches, np.flip(train_patches, axis=2).copy()], axis=0)
+
+train_patches = shuffle(train_patches)
+
+train_patches, val_patches = train_test_split(
+    train_patches,
+    test_size=0.5,
+    random_state=118
+)
+
+# --- PYTORCH SPECIFIC FORMATTING ---
+# Convert Keras format (N, H, W, C) to PyTorch format (N, C, H, W)
+train_patches = train_patches.transpose(0, 3, 1, 2)
+val_patches = val_patches.transpose(0, 3, 1, 2)
+
+# Create PyTorch DataLoaders
+batch_size = 128 # Pulled from your net.Settings() equivalent
+train_loader = DataLoader(
+    TensorDataset(torch.tensor(train_patches, dtype=torch.float32), torch.tensor(train_patches, dtype=torch.float32)),
+    batch_size=batch_size, shuffle=True
+)
+val_loader = DataLoader(
+    TensorDataset(torch.tensor(val_patches, dtype=torch.float32), torch.tensor(val_patches, dtype=torch.float32)),
+    batch_size=batch_size, shuffle=False
+)
+```
+
+# CNN Architecture & training
+
+(Here we replace Keras callbacks with a standard PyTorch training loop)
+
+```{python}
+# Setup hyperparameters
+patience = 10
+lr_factor = 0.1
+epochs = 100
+learning_rate = 0.001
+
+# Initialize Model, Loss, and Optimizer
+model = parse_net(architecture)(in_channels=ny, out_channels=ny).to(device)
+criterion = nn.MSELoss()
+optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+
+# PyTorch equivalent of ReduceLROnPlateau
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer, mode='min', factor=lr_factor, patience=patience//2, min_lr=0
+)
+
+out_name = f"{field}_{campaign}_{architecture}_patch{patch_size}_stride{patch_stride}_bsc{n_bsc}_ny{ny}"
+chkpt_path = os.path.join(out_path, f"{out_name}.pth") # .pth is standard for PyTorch weights
+
+print(model) # Equivalent to model.summary()
+
+# --- PyTorch Training Loop ---
+best_val_loss = float('inf')
+epochs_no_improve = 0
+
+for epoch in range(epochs):
+    # Training Phase
+    model.train()
+    train_loss = 0.0
+    for inputs, targets in train_loader:
+        inputs, targets = inputs.to(device), targets.to(device)
+
+        optimizer.zero_grad()
+        outputs, _ = model(inputs) # model returns (decoded, encoded)
+        loss = criterion(outputs, targets)
+        loss.backward()
+        optimizer.step()
+
+        train_loss += loss.item() * inputs.size(0)
+    train_loss /= len(train_loader.dataset)
+
+    # Validation Phase
+    model.eval()
+    val_loss = 0.0
+    with torch.no_grad():
+        for inputs, targets in val_loader:
+            inputs, targets = inputs.to(device), targets.to(device)
+            outputs, _ = model(inputs)
+            loss = criterion(outputs, targets)
+            val_loss += loss.item() * inputs.size(0)
+    val_loss /= len(val_loader.dataset)
+
+    scheduler.step(val_loss) # Update learning rate if plateaued
+
+    # Early Stopping & Checkpointing
+    if val_loss < best_val_loss:
+        best_val_loss = val_loss
+        epochs_no_improve = 0
+        # Equivalent to ModelCheckpoint (save_best_only, save_weights_only)
+        torch.save(model.state_dict(), chkpt_path)
+    else:
+        epochs_no_improve += 1
+
+    if epoch % 5 == 0:
+        print(f"Epoch {epoch}/{epochs} - Train Loss: {train_loss:.6f} - Val Loss: {val_loss:.6f}")
+
+    if epochs_no_improve >= patience:
+        print(f"Early stopping triggered at epoch {epoch}")
+        break
+
+print('Training done!')
+```
+
+# Deployment (test) - load dataset
+
+```{python}
+from sklearn.metrics import roc_curve, roc_auc_score
+
+# in this case, the dataset for training is the same for testing
+train_path = in_path
+dataset = np.load('./datasets/' + str(in_path), allow_pickle=True).item()
+
+data = dataset['data']
+gt = np.asarray(dataset['ground_truth'])
+del dataset
+
+pe = PatchExtractor(patch_size_tuple, stride=patch_stride_tuple)
+
+test_idx = np.arange(data.shape[0])
+if in_path == train_path:
+    train_idx = np.where(gt == 0)[0][:n_bsc]
+    test_idx = np.delete(test_idx, train_idx)
+
+testset = data[test_idx]
+gt = gt[test_idx]
+del data
+testset = np.moveaxis(testset, np.argmin(testset.shape), -1)
+```
+
+```{python}
+training = './cnn_article/giuriati_2_20170621_deg0_HHVV_Auto3D2_patch64_stride4_bsc5_ny3'
+net_weights = training + '.h5'
+```
+
+### Test Loop & Evaluation
+
+(To avoid running out of GPU memory, PyTorch needs us to pass test data in batches manually. We calculate the mseFeat in batches and compile them).
+
+```{python}
+# Extract patches (Shape: N, 64, 64, 3)
+patches = pe.extract(testset)
+del testset
+
+patchesIdx = patches.shape # Save original shape for reconstruct step
+
+# Convert to PyTorch format and create DataLoader for inference
+test_patches = patches.reshape((-1,) + patch_size_tuple).transpose(0, 3, 1, 2)
+test_loader = DataLoader(
+    TensorDataset(torch.tensor(test_patches, dtype=torch.float32)),
+    batch_size=batch_size, shuffle=False
+)
+del patches
+
+# Load best weights
+model.load_state_dict(torch.load(chkpt_path))
+model.eval()
+
+mseFeat_list = []
+
+print("Running inference...")
+with torch.no_grad():
+    for (batch_x,) in tqdm(test_loader):
+        batch_x = batch_x.to(device)
+
+        # encoder.predict(patches)
+        enc_orig = model.encode(batch_x)
+
+        # encoder.predict(patches_hat)
+        dec_hat = model.decode(enc_orig)
+        enc_hat = model.encode(dec_hat)
+
+        # Calculate MSE feature per batch
+        mse = ((enc_orig - enc_hat)**2).mean(dim=(1, 2, 3)) # Average over channels, H, W
+        mseFeat_list.append(mse.cpu().numpy())
+
+# Combine batches
+mseFeat = np.concatenate(mseFeat_list)
+
+# Broadcast the MSE values back to the original patch shape for reconstruction
+# patchesIdx is (N, 64, 64, ny) exactly as pe.reconstruct expects
+mseFeat_patches = np.zeros(patchesIdx) + mseFeat.reshape((-1, 1, 1, 1))
+
+mseFeat_vol = pe.reconstruct(mseFeat_patches.reshape(patchesIdx))
+del mseFeat_patches
+
+# Evaluation
+mse_mask_max = np.max(mseFeat_vol, axis=(0, 1))
+fpr_max, tpr_max, thresholds_max = roc_curve(gt, mse_mask_max)
+roc_auc_max = roc_auc_score(gt, mse_mask_max)
+print('best AUC = %0.2f' % roc_auc_max)
+```
+
+
