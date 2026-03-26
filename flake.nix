@@ -27,7 +27,6 @@
                     libICE
                     libSM
                     libGL
-                    linuxPackages.nvidia_x11
                 ];
             in {
                 devShells.default = pkgs.mkShell {
@@ -35,6 +34,8 @@
                         python312
                         python312Packages.pip
                         python312Packages.virtualenv
+                        python312Packages.jupyter
+                        python312Packages.notebook
                         gcc
                         gnumake
                         pkg-config
@@ -47,7 +48,7 @@
                         fi
                         source .venv/bin/activate
 
-                        export LD_LIBRARY_PATH="${libPath}:$LD_LIBRARY_PATH"
+                        export LD_LIBRARY_PATH="${libPath}:/run/opengl-driver/lib:/run/opengl-driver-32/lib:$LD_LIBRARY_PATH"
 
                         echo "Venv has been activated"
                         echo "To install requirement packages use: pip install -r requirements.txt"
