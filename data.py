@@ -4,10 +4,8 @@ import matplotlib.pyplot as plt
 file_path = "datasets/giuriati_2/20170621_deg0_HHVV.npy"
 
 print("Завантаження датасету...")
-# Додаємо allow_pickle=True та викликаємо .item(), щоб розпакувати словник
 dataset = np.load(file_path, allow_pickle=True).item()
 
-# Витягуємо самі матриці та розмітку
 data = dataset['data']
 gt = dataset['ground_truth']
 
@@ -24,7 +22,6 @@ print("-" * 40)
 vis_data = np.moveaxis(data, np.argmin(data.shape), -1)
 print(f"Формат після moveaxis (для візуалізації): {vis_data.shape}")
 
-# Візуалізуємо
 fig, axes = plt.subplots(1, 2, figsize=(15, 6))
 
 # Беремо перший канал поляризації (наприклад, HH)
