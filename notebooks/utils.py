@@ -279,11 +279,7 @@ def plot_comparison_from_json(json_file, channel_type='1_channel', anomaly_start
         plt.plot(x_axis, lat_mse, marker=style['marker'], color=style['color'], 
                  linewidth=2, alpha=0.8, label=style['label'])
 
-    if plotted_any:
-        # Виділяємо зону міни
-        plt.axvspan(anomaly_start, anomaly_end, color='gray', alpha=0.15, 
-                    label=f'Фактична міна (Вікна {anomaly_start}-{anomaly_end})')
-        
+    if plotted_any:    
         plt.title(f"Порівняння архітектур ({channel_type}): Latent Error $Z_1 - Z_2$")
         plt.xlabel("Номер патча (Вікно ковзає по профілю)")
         plt.ylabel("Рівень аномальності (MSE)")
